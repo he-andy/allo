@@ -5,6 +5,7 @@
 import os
 import numpy as np
 
+
 from ._mlir.ir import (
     Location,
     MemRefType,
@@ -738,7 +739,7 @@ def df_pipeline(module, initiation_interval=1, rewind=False):
 def check_perfect_affine_kernel(module):
     """
     Checks whether the module is a perfect affine kernel (https://arxiv.org/pdf/2501.09118).
-    
+
     A perfect affine kernel is defined as a module in which every function
     consists solely of perfectly nested affine.for loops with constant bounds.
     In each perfect nest, if an affine.for contains an inner loop, it must be
@@ -746,33 +747,38 @@ def check_perfect_affine_kernel(module):
     loop, only allowed arithmetic/memory ops (e.g. loads, stores, arithmetic,
     and affine.apply) are permitted.
     """
+
+
+
     def is_terminator(op):
-        return op.has_trait("OpTrait::IsTerminator")
+        return isinstance(op, (affine_d.AffineYieldOp, func_d.ReturnOp))
 
     def is_constant_affine_for(loop_op):
-        lower = loop_op.attributes.get("lower_bound")
-        upper = loop_op.attributes.get("upper_bound")
-        if lower is None or upper is None:
-            return False
+        def is_constant_affine_map(affine_map):
+            return affine_map.n_dims == 0 and len(affine_map.results) == 1
+
         try:
-            int(lower.value)
-            int(upper.value)
-            return True
-        except Exception:
+            lower_map = loop_op.lowerBoundMap.value
+            lower_operands = loop_op.lowerBoundOperands
+            upper_map = loop_op.upperBoundMap.value
+            upper_operands = loop_op.upperBoundOperands
+
+            lower_constant = is_constant_affine_map(lower_map) and not len(lower_operands)
+            upper_constant = is_constant_affine_map(upper_map) and not len(upper_operands)
+            return lower_constant and upper_constant
+
+        except AttributeError as e:
+            print(f"Error accessing affine.for properties: {e}")
             return False
 
+
     def is_allowed_innermost_body(op):
-        allowed_types = (
-            arith_d.AddIOp, arith_d.AddFOp, arith_d.MulIOp, arith_d.MulFOp,
-            memref_d.LoadOp, affine_d.AffineLoadOp,
-            memref_d.StoreOp, affine_d.AffineStoreOp,
-            arith_d.ConstantOp, affine_d.AffineApplyOp,
-        )
-        return isinstance(op, allowed_types)
+        return op.OPERATION_NAME.startswith("arith.") or op.OPERATION_NAME.startswith("memref.") or op.OPERATION_NAME.startswith("affine.")
 
     def check_perfect_loop_nest(loop_op):
         # check for constant loop bounds
         if not is_constant_affine_for(loop_op):
+            print("not constant affine for", loop_op)
             return False
 
         # check each affine.for has one region with a single block.
@@ -785,22 +791,25 @@ def check_perfect_affine_kernel(module):
         inner_loops = [op for op in body_ops if isinstance(op, affine_d.AffineForOp)]
         if inner_loops:
             if len(body_ops) != 1:
-                #print("Loop", loop_op, "has extra ops besides the inner loop:", body_ops)
+                print("Loop", loop_op, "has extra ops besides the inner loop:", body_ops)
                 return False
             return check_perfect_loop_nest(inner_loops[0])
         else:
             for op in body_ops:
                 if not is_allowed_innermost_body(op):
-                    #print("Operation", op, "in innermost loop is not allowed.")
+                    print("Operation", op, "in innermost loop is not allowed.")
                     return False
             return True
 
     def check_function_perfect_affine(func):
         top_level_ops = [op for op in func.entry_block.operations if not is_terminator(op)]
         if not top_level_ops:
+            print('no top level ops', top_level_ops)
             return False
         for op in top_level_ops:
-            if not isinstance(op, affine_d.AffineForOp) or not check_perfect_loop_nest(op):
+            if not (isinstance(op, memref_d.AllocOp)
+                or (isinstance(op, affine_d.AffineForOp) and check_perfect_loop_nest(op))):
+                print(op, "is not a perfect affine loop.")
                 return False
         return True
 
@@ -809,6 +818,7 @@ def check_perfect_affine_kernel(module):
             if isinstance(op, func_d.FuncOp):
                 func_name = op.attributes["sym_name"].value
                 if not check_function_perfect_affine(op):
+                    print("Function", func_name, "is not a perfect affine kernel.")
                     return False
     return True
 
@@ -819,7 +829,7 @@ def dataflow_canonicalization(module):
             op for op in func.entry_block.operations if isinstance(op, memref_d.AllocOp)
         ]
 
-        for alloc in alloc_ops: 
+        for alloc in alloc_ops:
             orig_buffer = alloc.result
 
             producers = []
@@ -827,14 +837,14 @@ def dataflow_canonicalization(module):
             for use in orig_buffer.uses:
                 op = use.owner
                 if isinstance(op, (memref_d.StoreOp, affine_d.AffineStoreOp)):
-                    producers.append(op)  
+                    producers.append(op)
                 elif isinstance(op, (memref_d.LoadOp, affine_d.AffineLoadOp)):
-                    consumers.append(op) 
+                    consumers.append(op)
             # check that it is in a single-producer-single-consumer relationship
             if len(producers) == 1 and len(consumers) <= 1:
-                continue  
+                continue
 
-            for consumer in consumers: 
+            for consumer in consumers:
                 # duplicate consumer buffer
                 new_alloc = memref_d.AllocOp(
                     orig_buffer.type,
@@ -852,7 +862,7 @@ def dataflow_canonicalization(module):
                 for idx, operand in enumerate(consumer.operands):
                     if operand is orig_buffer:
                         consumer.operands[idx] = new_alloc.result
-                
+
     with module.context:
         for func in module.body.operations:
             if isinstance(func, func_d.FuncOp):
@@ -862,10 +872,10 @@ def dataflow_canonicalization(module):
     with module.context, Location.unknown():
         for func in module.body.operations:
             if not isinstance(func, func_d.FuncOp):
-                continue 
-            
+                continue
+
             alloc_ops = [op for op in func.walk() if isinstance(op, memref_d.AllocOp)]
-            
+
             for alloc in alloc_ops:
                 orig_buffer = alloc.result
                 consumer_map = {}
@@ -874,28 +884,24 @@ def dataflow_canonicalization(module):
                     if consumer not in consumer_map:
                         consumer_map[consumer] = []
                     consumer_map[consumer].append(use)
-                
+
                 if len(consumer_map) <= 1:
                     continue
-                
+
                 for consumer_op, use_list in consumer_map.items():
                     ip = InsertionPoint(consumer_op)
-                    
+
                     new_alloc = memref_d.AllocOp(
-                        orig_buffer.type,  
-                        [],    
+                        orig_buffer.type,
+                        [],
                         [],
                         ip=ip
                     )
-                    
+
                     orig_name = alloc.attributes["name"].value if "name" in alloc.attributes else "buffer"
                     new_alloc.attributes["name"] = StringAttr.get(f'{orig_name}_dup')
-                    
+
                     memref_d.CopyOp(orig_buffer, new_alloc.result, ip=ip)
-                    
+
                     for use in use_list:
                         consumer_op.replace_operand(use.operand_number, new_alloc.result)
-
-
-        
-            
