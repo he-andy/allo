@@ -746,6 +746,9 @@ def check_perfect_affine_kernel(module):
     loop, only allowed arithmetic/memory ops (e.g. loads, stores, arithmetic,
     and affine.apply) are permitted.
     """
+    def is_terminator(op):
+        return op.has_trait("OpTrait::IsTerminator")
+
     def is_constant_affine_for(loop_op):
         lower = loop_op.attributes.get("lower_bound")
         upper = loop_op.attributes.get("upper_bound")
@@ -793,7 +796,7 @@ def check_perfect_affine_kernel(module):
             return True
 
     def check_function_perfect_affine(func):
-        top_level_ops = [op for op in func.entry_block.operations if not op.is_terminator()]
+        top_level_ops = [op for op in func.entry_block.operations if not is_terminator(op)]
         if not top_level_ops:
             return False
         for op in top_level_ops:
